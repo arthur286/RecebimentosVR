@@ -178,41 +178,65 @@ const Analise = (() => {
 
   /** Normaliza as linhas brutas de VENDAS */
   function normalizeVendas(rows) {
-    const cols = detectColumns(rows, 'vendas');
-    return rows
-      .map((r, i) => {
-        const dataVenda = parseDate(cols.data ? r[cols.data] : null);
-        const bruto     = parseMoney(cols.bruto   ? r[cols.bruto]   : null);
-        const taxa      = parseMoney(cols.taxa     ? r[cols.taxa]    : null);
-        let   liquido   = parseMoney(cols.liquido  ? r[cols.liquido] : null);
+  const cols = detectColumns(rows, 'vendas');
+  
+  // Adicionar detecção específica para "Data de Pagamento"
+  const dataPagamentoCol = Object.keys(rows[0] || {}).find(k => 
+    k.toLowerCase().includes('data de pagamento') || 
+    k.toLowerCase().includes('pagamento') ||
+    k.toLowerCase().includes('settlement date') ||
+    k === 'M'  // fallback para coluna M (índice)
+  );
+  
+  return rows
+    .map((r, i) => {
+      const dataVenda = parseDate(cols.data ? r[cols.data] : null);
+      const bruto     = parseMoney(cols.bruto   ? r[cols.bruto]   : null);
+      const taxa      = parseMoney(cols.taxa     ? r[cols.taxa]    : null);
+      let   liquido   = parseMoney(cols.liquido  ? r[cols.liquido] : null);
+      
+      // LER DATA DE PAGAMENTO REAL DA PLANILHA (coluna M)
+      let dataPagamentoReal = null;
+      if (dataPagamentoCol) {
+        dataPagamentoReal = parseDate(r[dataPagamentoCol]);
+      }
+      
+      // Se não encontrou pela busca, tenta pegar pelo índice M (13ª coluna)
+      if (!dataPagamentoReal && r['M']) {
+        dataPagamentoReal = parseDate(r['M']);
+      }
+      
+      // Se ainda não tem, tenta pela posição do array (13º elemento = índice 12)
+      if (!dataPagamentoReal && Array.isArray(r) && r[12]) {
+        dataPagamentoReal = parseDate(r[12]);
+      }
 
-        // calcular líquido se não informado
-        if (isNaN(liquido) && !isNaN(bruto) && !isNaN(taxa)) {
-          // taxa pode ser % (ex: 2.5) ou valor absoluto (ex: 25.00)
-          liquido = taxa < 1
-            ? bruto * (1 - taxa)
-            : bruto - taxa;
-        }
+      // calcular líquido se não informado
+      if (isNaN(liquido) && !isNaN(bruto) && !isNaN(taxa)) {
+        liquido = taxa < 1 ? bruto * (1 - taxa) : bruto - taxa;
+      }
 
-        // prazo D+N
-        const prazoRaw = cols.prazo ? String(r[cols.prazo] || '') : '';
-        const prazoNum = parseInt(prazoRaw.replace(/\D/g, '')) || 30;
+      // prazo D+N (apenas para referência)
+      const prazoRaw = cols.prazo ? String(r[cols.prazo] || '') : '';
+      const prazoNum = parseInt(prazoRaw.replace(/\D/g, '')) || 30;
 
-        return {
-          _idx:        i,
-          id:          cols.id ? r[cols.id] : `V${i+1}`,
-          operadora:   normalizeOp(cols.operadora ? r[cols.operadora] : null),
-          dataVenda,
-          bruto,
-          taxa,
-          liquido,
-          prazo:       prazoNum,
-          dataPrevista: dataVenda ? addDays(dataVenda, prazoNum) : null,
-          _raw:        r,
-        };
-      })
-      .filter(v => v.dataVenda && !isNaN(v.bruto));
-  }
+      return {
+        _idx:        i,
+        id:          cols.id ? r[cols.id] : `V${i+1}`,
+        operadora:   normalizeOp(cols.operadora ? r[cols.operadora] : null),
+        dataVenda,
+        bruto,
+        taxa,
+        liquido,
+        prazo:       prazoNum,
+        dataPrevista: dataVenda ? addDays(dataVenda, prazoNum) : null,
+        // ⭐ NOVO: data de pagamento REAL vinda da planilha
+        dataPagamentoReal: dataPagamentoReal,
+        _raw:        r,
+      };
+    })
+    .filter(v => v.dataVenda && !isNaN(v.bruto));
+}
 
   /** Normaliza as linhas brutas de RECEBIMENTOS */
   function normalizeRecebimentos(rows) {
@@ -243,72 +267,112 @@ const Analise = (() => {
    * Se não achar nada, marca como "nao_recebido".
    */
   function matchAll(vendas, recebimentos) {
-    // Cópia para não mutar os originais
-    const recList = recebimentos.map(r => ({ ...r, _used: false }));
+  const recList = recebimentos.map(r => ({ ...r, _used: false }));
 
-    return vendas.map(venda => {
-      // Candidatos: mesma operadora (ou desconhecida nos dois lados)
-      const candidatos = recList.filter(r =>
+  return vendas.map(venda => {
+    // ⭐ PRIORIDADE: Se a venda já tem data de pagamento real na planilha, usa ela!
+    if (venda.dataPagamentoReal) {
+      // Busca recebimento que corresponde a essa data real
+      const matchReal = recList.find(r => 
         !r._used &&
-        (r.operadora === venda.operadora || r.operadora === 'Desconhecida' || venda.operadora === 'Desconhecida')
+        (r.operadora === venda.operadora || r.operadora === 'Desconhecida' || venda.operadora === 'Desconhecida') &&
+        Math.abs(r.valor - venda.liquido) / (venda.liquido || 1) <= TAXA_THRESHOLD &&
+        dateKey(r.dataPagamento) === dateKey(venda.dataPagamentoReal)
       );
-
-      // Tenta match perfeito: valor dentro do threshold + data na janela
-      const matchExato = candidatos.find(r => {
-        const diffValor = Math.abs(r.valor - venda.liquido) / (venda.liquido || 1);
-        const dentroData = venda.dataPrevista
-          ? diffDays(r.dataPagamento, venda.dataPrevista) <= DATE_WINDOW
-          : true;
-        return diffValor <= TAXA_THRESHOLD && dentroData;
-      });
-
-      if (matchExato) {
-        matchExato._used = true;
-        const diffValor = Math.abs(matchExato.valor - venda.liquido);
+      
+      if (matchReal) {
+        matchReal._used = true;
         return {
           ...venda,
-          status:        'ok',
-          recebimento:   matchExato,
-          dataPagamento: matchExato.dataPagamento,
-          valorRecebido: matchExato.valor,
-          diferenca:     matchExato.valor - venda.liquido,
-          diffDias:      venda.dataPrevista ? diffDays(matchExato.dataPagamento, venda.dataPrevista) : null,
+          status: 'ok',
+          recebimento: matchReal,
+          dataPagamento: matchReal.dataPagamento,
+          valorRecebido: matchReal.valor,
+          diferenca: matchReal.valor - venda.liquido,
+          diffDias: venda.dataPrevista ? diffDays(matchReal.dataPagamento, venda.dataPrevista) : null,
         };
       }
-
-      // Tenta match por operadora + data (valor diferente = erro de taxa)
-      const matchTaxa = candidatos.find(r => {
-        const dentroData = venda.dataPrevista
-          ? diffDays(r.dataPagamento, venda.dataPrevista) <= DATE_WINDOW * 2
-          : true;
-        return dentroData;
-      });
-
-      if (matchTaxa) {
-        matchTaxa._used = true;
+      
+      // Se não achou match exato, ainda tenta vincular pela data real
+      const matchDataReal = recList.find(r => 
+        !r._used &&
+        dateKey(r.dataPagamento) === dateKey(venda.dataPagamentoReal)
+      );
+      
+      if (matchDataReal) {
+        matchDataReal._used = true;
+        const diffValor = Math.abs(matchDataReal.valor - venda.liquido);
         return {
           ...venda,
-          status:        'erro_taxa',
-          recebimento:   matchTaxa,
-          dataPagamento: matchTaxa.dataPagamento,
-          valorRecebido: matchTaxa.valor,
-          diferenca:     matchTaxa.valor - venda.liquido,
-          diffDias:      venda.dataPrevista ? diffDays(matchTaxa.dataPagamento, venda.dataPrevista) : null,
+          status: diffValor <= (venda.liquido * TAXA_THRESHOLD) ? 'ok' : 'erro_taxa',
+          recebimento: matchDataReal,
+          dataPagamento: matchDataReal.dataPagamento,
+          valorRecebido: matchDataReal.valor,
+          diferenca: matchDataReal.valor - venda.liquido,
+          diffDias: venda.dataPrevista ? diffDays(matchDataReal.dataPagamento, venda.dataPrevista) : null,
         };
       }
+    }
+    
+    // Se não tem data real OU não achou match, segue lógica original...
+    const candidatos = recList.filter(r =>
+      !r._used &&
+      (r.operadora === venda.operadora || r.operadora === 'Desconhecida' || venda.operadora === 'Desconhecida')
+    );
 
-      // Não encontrado
+    // Resto do matching original...
+    const matchExato = candidatos.find(r => {
+      const diffValor = Math.abs(r.valor - venda.liquido) / (venda.liquido || 1);
+      const dentroData = venda.dataPrevista
+        ? diffDays(r.dataPagamento, venda.dataPrevista) <= DATE_WINDOW
+        : true;
+      return diffValor <= TAXA_THRESHOLD && dentroData;
+    });
+
+    if (matchExato) {
+      matchExato._used = true;
       return {
         ...venda,
-        status:        'nao_recebido',
-        recebimento:   null,
-        dataPagamento: null,
-        valorRecebido: null,
-        diferenca:     null,
-        diffDias:      null,
+        status: 'ok',
+        recebimento: matchExato,
+        dataPagamento: matchExato.dataPagamento,
+        valorRecebido: matchExato.valor,
+        diferenca: matchExato.valor - venda.liquido,
+        diffDias: venda.dataPrevista ? diffDays(matchExato.dataPagamento, venda.dataPrevista) : null,
       };
+    }
+
+    const matchTaxa = candidatos.find(r => {
+      const dentroData = venda.dataPrevista
+        ? diffDays(r.dataPagamento, venda.dataPrevista) <= DATE_WINDOW * 2
+        : true;
+      return dentroData;
     });
-  }
+
+    if (matchTaxa) {
+      matchTaxa._used = true;
+      return {
+        ...venda,
+        status: 'erro_taxa',
+        recebimento: matchTaxa,
+        dataPagamento: matchTaxa.dataPagamento,
+        valorRecebido: matchTaxa.valor,
+        diferenca: matchTaxa.valor - venda.liquido,
+        diffDias: venda.dataPrevista ? diffDays(matchTaxa.dataPagamento, venda.dataPrevista) : null,
+      };
+    }
+
+    return {
+      ...venda,
+      status: 'nao_recebido',
+      recebimento: null,
+      dataPagamento: venda.dataPagamentoReal || null,  // ← usa a data real se tiver
+      valorRecebido: null,
+      diferenca: null,
+      diffDias: null,
+    };
+  });
+}
 
   /* ── Agrupamento ──────────────────────────────────────────────────────── */
 
