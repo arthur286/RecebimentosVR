@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Conciliação · Operadoras</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- ════════════════════════════════ HEADER ═══════════════════════════════ -->
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-icon">⬡</span>
+        <div>
+          <h1 class="brand-title">CONCILIAÇÃO</h1>
+          <p class="brand-sub">Controle de Operadoras de Benefícios</p>
+        </div>
+      </div>
+      <div class="header-meta">
+        <span class="week-badge" id="currentWeekBadge">Carregando...</span>
+        <button class="btn-nova-semana" id="btnNovaSemana">
+          <span class="btn-icon">↺</span> Nova Semana
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ═════════════════════════════ INDICADORES ════════════════════════════ -->
+  <section class="indicators-section" aria-label="Resumo dos indicadores">
+    <div class="indicators-grid">
+
+      <div class="indicator-card indicator-ok">
+        <div class="ind-number" id="indOk">0</div>
+        <div class="ind-label">Conciliações OK</div>
+        <div class="ind-icon">✔</div>
+      </div>
+
+      <div class="indicator-card indicator-pending">
+        <div class="ind-number" id="indPending">0</div>
+        <div class="ind-label">Transferências Pendentes</div>
+        <div class="ind-icon">⏳</div>
+      </div>
+
+      <div class="indicator-card indicator-problem">
+        <div class="ind-number" id="indProblem">0</div>
+        <div class="ind-label">Com Pendência</div>
+        <div class="ind-icon">❗</div>
+      </div>
+
+      <div class="indicator-card indicator-incomplete">
+        <div class="ind-number" id="indIncomplete">0</div>
+        <div class="ind-label">Incompletos</div>
+        <div class="ind-icon">⚠</div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════ PERIOD SELECTOR ══════════════════════════ -->
+  <section class="period-section">
+    <div class="period-inner">
+      <label class="period-label" for="globalPeriod">
+        <span class="period-label-icon">📅</span> Período da Semana
+      </label>
+      <input type="text" id="globalPeriod" class="period-input"
+             placeholder="ex: 22/04 a 29/04" autocomplete="off" />
+      <button class="btn-apply-period" id="btnApplyPeriod">Aplicar a todos</button>
+    </div>
+  </section>
+
+  <!-- ════════════════════════════ OPERATOR CARDS ══════════════════════════ -->
+  <main class="cards-section" aria-label="Cards das operadoras">
+    <div class="cards-grid" id="cardsGrid">
+      <!-- Cards are rendered by script.js -->
+    </div>
+
+    <!-- Save button -->
+    <div class="save-row">
+      <button class="btn-save" id="btnSave">
+        <span class="btn-icon">💾</span> Salvar Semana
+      </button>
+      <span class="save-feedback" id="saveFeedback"></span>
+    </div>
+  </main>
+
+  <!-- ══════════════════════ ANÁLISE DE RECEBIMENTOS ══════════════════════ -->
+  <section class="analise-section" aria-label="Análise de Recebimentos">
+    <div class="analise-section-inner">
+
+      <!-- Cabeçalho da seção -->
+      <div class="analise-section-header">
+        <div>
+          <h2 class="analise-section-title">
+            <span class="analise-title-icon">◎</span> Análise de Recebimentos
+          </h2>
+          <p class="analise-section-sub">Importe Vendas e Recebimentos para cruzar automaticamente</p>
+        </div>
+      </div>
+
+      <!-- Upload zone -->
+      <div class="analise-upload-row">
+
+        <div class="drop-zone" id="dropVendas">
+          <div class="dz-icon">📊</div>
+          <span class="dz-label">Arraste ou clique para importar<br><strong>VENDAS</strong> (.xlsx / .csv)</span>
+          <input type="file" id="fileVendas" accept=".xlsx,.xls,.csv" style="display:none" />
+        </div>
+
+        <div class="analise-upload-arrow">→</div>
+
+        <div class="drop-zone" id="dropRecebimentos">
+          <div class="dz-icon">💳</div>
+          <span class="dz-label">Arraste ou clique para importar<br><strong>RECEBIMENTOS</strong> (.xlsx / .csv)</span>
+          <input type="file" id="fileRecebimentos" accept=".xlsx,.xls,.csv" style="display:none" />
+        </div>
+
+      </div>
+
+      <!-- Ações -->
+      <div class="analise-actions-row">
+        <button class="btn-processar" id="btnProcessarAnalise">▶ Processar Análise</button>
+        <button class="btn-exportar" id="btnExportar">⬇ Exportar Excel</button>
+        <span class="analise-feedback" id="analiseFeedback"></span>
+      </div>
+
+      <!-- Empty state -->
+      <p class="analise-empty" id="analiseEmpty">Importe os arquivos acima e clique em Processar para ver o dashboard.</p>
+
+      <!-- Dashboard (oculto até processar) -->
+      <div id="analiseDashboard" style="display:none">
+
+        <!-- Indicadores da análise -->
+        <div class="analise-indicators">
+          <div class="ai-card ai-total">
+            <div class="ai-num" id="aInd_total">0</div>
+            <div class="ai-lbl">Total Vendas</div>
+          </div>
+          <div class="ai-card ai-ok">
+            <div class="ai-num" id="aInd_ok">0</div>
+            <div class="ai-lbl">OK</div>
+          </div>
+          <div class="ai-card ai-erro">
+            <div class="ai-num" id="aInd_erro">0</div>
+            <div class="ai-lbl">Erro de Taxa</div>
+          </div>
+          <div class="ai-card ai-nrec">
+            <div class="ai-num" id="aInd_naoRec">0</div>
+            <div class="ai-lbl">Não Recebido</div>
+          </div>
+          <div class="ai-card ai-bruto">
+            <div class="ai-num ai-num-sm" id="aInd_bruto">R$ 0</div>
+            <div class="ai-lbl">Total Bruto</div>
+          </div>
+          <div class="ai-card ai-recebido">
+            <div class="ai-num ai-num-sm" id="aInd_recebido">R$ 0</div>
+            <div class="ai-lbl">Total Recebido</div>
+          </div>
+        </div>
+
+        <!-- Filtros -->
+        <div class="analise-filters">
+          <select class="analise-select" id="filtroOperadora">
+            <option value="TODAS">Todas as operadoras</option>
+          </select>
+          <input type="date" class="analise-date-input" id="filtroDe"  title="De" />
+          <input type="date" class="analise-date-input" id="filtroAte" title="Até" />
+          <button class="btn-limpar-filtros" id="btnLimparFiltros">✕ Limpar filtros</button>
+        </div>
+
+        <!-- Cards de grupos -->
+        <div class="analise-grupos" id="analiseGrupos"></div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════════════════════ HISTORY ═════════════════════════════ -->
+  <section class="history-section" id="historySection" aria-label="Histórico">
+    <div class="history-header">
+      <h2 class="history-title">
+        <span class="history-title-icon">◈</span> Histórico de Semanas
+      </h2>
+      <button class="btn-clear-history" id="btnClearHistory">Limpar histórico</button>
+    </div>
+    <div class="history-list" id="historyList">
+      <!-- Injected by script.js -->
+    </div>
+    <p class="history-empty" id="historyEmpty">Nenhum registro salvo ainda.</p>
+  </section>
+
+  <!-- ══════════════════════════ MODAL CONFIRM ══════════════════════════════ -->
+  <div class="modal-overlay" id="modalOverlay" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-box">
+      <h3 class="modal-title" id="modalTitle">Nova Semana</h3>
+      <p class="modal-body" id="modalBody">Os dados atuais serão salvos no histórico e os campos serão limpos. Deseja continuar?</p>
+      <div class="modal-actions">
+        <button class="btn-modal-cancel" id="modalCancel">Cancelar</button>
+        <button class="btn-modal-confirm" id="modalConfirm">Confirmar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="script.js"></script>
+  <script src="analise.js"></script>
+</body>
+</html>
