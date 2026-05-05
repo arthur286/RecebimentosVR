@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   CONCILIAÇÃO · MÓDULO DE ANÁLISE DE RECEBIMENTOS — analise.js
+   CONCILIAÇÃO · MÓDULO DE ANÁLISE DE RECEBIMENTOS — VERSÃO CORRIGIDA
    Processamento local de Excel/CSV, matching, dashboard e exportação
    ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -9,26 +9,43 @@
 const Analise = (() => {
 
   /* ── Estado interno ───────────────────────────────────────────────────── */
-  let _vendas       = [];   // linhas normalizadas do arquivo de vendas
-  let _recebimentos = [];   // linhas normalizadas do arquivo de recebimentos
-  let _resultado    = [];   // vendas com status resolvido
+  let _vendas       = [];
+  let _recebimentos = [];
+  let _resultado    = [];
   let _filtroOp     = 'TODAS';
   let _filtroPeriod = { de: '', ate: '' };
+  let _debugLogs    = [];
 
-  /* Tolerância de valor: diferença ≤ threshold = "OK", senão "erro_taxa" */
-  const TAXA_THRESHOLD = 0.05; // 5%
-  /* Janela de busca de datas em dias */
+  const TAXA_THRESHOLD = 0.05;
   const DATE_WINDOW    = 5;
 
-  /* Operadoras reconhecidas → normalização */
   const OP_MAP = {
     ticket: 'Ticket', tk: 'Ticket', 'ticket restaurante': 'Ticket',
     vr: 'VR', 'vale refeição': 'VR', 'vale refeicao': 'VR',
     alelo: 'Alelo',
     pluxee: 'Pluxee', sodexo: 'Pluxee',
+    rede: 'Rede', getnet: 'GetNet'
   };
 
-  /* ── Utilitários ──────────────────────────────────────────────────────── */
+  function addDebugLog(category, message, data = null) {
+    const log = {
+      timestamp: new Date().toISOString(),
+      category,
+      message,
+      data: data ? JSON.parse(JSON.stringify(data)) : null
+    };
+    _debugLogs.push(log);
+    console.log(`[DEBUG][${category}]`, message, data || '');
+  }
+
+  function showDebugLogs() {
+    console.group('=== DEBUG: Conciliação Financeira ===');
+    _debugLogs.forEach(log => {
+      console.log(`[${log.timestamp}] [${log.category}] ${log.message}`);
+      if (log.data) console.log('  Dados:', log.data);
+    });
+    console.groupEnd();
+  }
 
   function normalizeOp(raw) {
     if (!raw) return 'Desconhecida';
@@ -36,33 +53,25 @@ const Analise = (() => {
     return OP_MAP[key] || String(raw).trim();
   }
 
-  /**
-   * Converte um valor para número, aceitando
-   * "R$ 1.234,56", "1234.56", "1,234.56" etc.
-   */
   function parseMoney(v) {
     if (v === null || v === undefined || v === '') return NaN;
     if (typeof v === 'number') return v;
+    
     let s = String(v).replace(/R\$\s*/g, '').trim();
-    // detectar formato pt-BR: 1.234,56
+    
     if (/^\d{1,3}(\.\d{3})*(,\d+)?$/.test(s)) {
       s = s.replace(/\./g, '').replace(',', '.');
     } else {
-      // remover separadores de milhar en-US
       s = s.replace(/,(?=\d{3})/g, '').replace(',', '.');
     }
+    
     return parseFloat(s);
   }
 
-  /**
-   * Converte qualquer representação de data para objeto Date.
-   * Aceita: número serial Excel, "dd/mm/yyyy", "yyyy-mm-dd", objetos Date.
-   */
   function parseDate(v) {
     if (!v) return null;
     if (v instanceof Date) return isNaN(v) ? null : v;
 
-    // número serial Excel (dias desde 1899-12-30)
     if (typeof v === 'number') {
       const d = new Date(Math.round((v - 25569) * 86400 * 1000));
       return isNaN(d) ? null : d;
@@ -70,50 +79,47 @@ const Analise = (() => {
 
     const s = String(v).trim();
 
-    // dd/mm/yyyy ou dd/mm/yy
     const dmY = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
     if (dmY) {
       let [, d, m, y] = dmY;
       if (y.length === 2) y = '20' + y;
-      return new Date(+y, +m - 1, +d);
+      return new Date(Date.UTC(+y, +m - 1, +d));
     }
 
-    // yyyy-mm-dd
     const Ymd = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
     if (Ymd) {
       const [, y, m, d] = Ymd;
-      return new Date(+y, +m - 1, +d);
+      return new Date(Date.UTC(+y, +m - 1, +d));
     }
 
     const dt = new Date(s);
     return isNaN(dt) ? null : dt;
   }
 
-  /** Formata Date → "dd/mm/yyyy" */
   function fmtDate(d) {
     if (!d) return '—';
-    return d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    const dia = d.getUTCDate();
+    const mes = d.getUTCMonth() + 1;
+    const ano = d.getUTCFullYear();
+    return `${dia.toString().padStart(2, '0')}/${mes.toString().padStart(2, '0')}/${ano}`;
   }
 
-  /** Retorna YYYY-MM-DD para comparação */
   function dateKey(d) {
     if (!d) return '';
     return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   }
 
-  /** Diferença absoluta em dias entre dois Date */
   function diffDays(a, b) {
+    if (!a || !b) return null;
     return Math.abs((a - b) / 86400000);
   }
 
-  /** Adiciona N dias a um Date */
   function addDays(d, n) {
     const r = new Date(d);
-    r.setDate(r.getDate() + n);
+    r.setUTCDate(r.getUTCDate() + n);
     return r;
   }
 
-  /** Formata moeda pt-BR */
   function fmtMoney(v) {
     if (isNaN(v) || v === null) return '—';
     return v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
@@ -121,10 +127,6 @@ const Analise = (() => {
 
   /* ── Leitura de arquivos via SheetJS ─────────────────────────────────── */
 
-  /**
-   * Lê um File (.xlsx ou .csv) e retorna array de objetos (primeira linha = cabeçalho).
-   * @returns {Promise<object[]>}
-   */
   function readFile(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -134,8 +136,104 @@ const Analise = (() => {
           const wb   = XLSX.read(data, { type: 'array', cellDates: false });
           const ws   = wb.Sheets[wb.SheetNames[0]];
           const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+          addDebugLog('FILE', `Arquivo lido: ${file.name}`, { linhas: rows.length });
           resolve(rows);
         } catch (err) {
+          addDebugLog('ERROR', `Erro ao ler arquivo: ${file.name}`, err);
+          reject(err);
+        }
+      };
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  /**
+   * Leitura ESPECÍFICA para planilha ERP (Olist)
+   * Lê todas as abas (Table 1, Table 2, Table 3, Table 4)
+   * Ignora linhas de cabeçalho e processa os dados corretamente
+   */
+  function readERPFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target.result);
+          const wb = XLSX.read(data, { type: 'array', cellDates: false });
+          
+          let allRows = [];
+          
+          // Processar todas as abas do arquivo
+          for (let sheetName of wb.SheetNames) {
+            addDebugLog('ERP', `Processando aba: ${sheetName}`);
+            
+            const ws = wb.Sheets[sheetName];
+            // Ler como array de arrays para ter controle total
+            const rawData = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+            
+            // Pular linhas de cabeçalho (primeiras 2-3 linhas)
+            let startRow = 0;
+            for (let i = 0; i < Math.min(5, rawData.length); i++) {
+              const row = rawData[i];
+              if (row && row[0] && String(row[0]).includes('Cliente')) {
+                startRow = i + 1;
+                break;
+              }
+            }
+            
+            // Processar linhas de dados
+            for (let i = startRow; i < rawData.length; i++) {
+              const row = rawData[i];
+              if (!row || row.length < 5) continue;
+              
+              const cliente = row[0];
+              const historico = row[1];
+              const vencimento = row[4];
+              const emissao = row[5];
+              const situacao = row[6];
+              const valor = row[8];
+              
+              // Pular linhas vazias ou de total
+              if (!historico || String(historico).includes('Total')) continue;
+              if (!valor || valor === 0) continue;
+              
+              // Extrair número do pedido do histórico
+              let numeroPedido = null;
+              const pedidoMatch = String(historico).match(/n[º°]\s*(\d+)/i);
+              if (pedidoMatch) {
+                numeroPedido = pedidoMatch[1];
+              }
+              
+              // Extrair parcela se houver
+              let parcela = null;
+              const parcelaMatch = String(historico).match(/parcela\s*(\d+)\/(\d+)/i);
+              if (parcelaMatch) {
+                parcela = `${parcelaMatch[1]}/${parcelaMatch[2]}`;
+              }
+              
+              allRows.push({
+                cliente,
+                historico,
+                numeroPedido,
+                parcela,
+                vencimento: vencimento,
+                emissao: emissao,
+                situacao: situacao,
+                valor: valor,
+                _sheet: sheetName,
+                _rowIndex: i
+              });
+            }
+          }
+          
+          addDebugLog('ERP', `Arquivo ERP processado`, { 
+            totalLinhas: allRows.length,
+            sheets: wb.SheetNames 
+          });
+          
+          resolve(allRows);
+        } catch (err) {
+          addDebugLog('ERROR', `Erro ao ler arquivo ERP: ${file.name}`, err);
           reject(err);
         }
       };
@@ -147,279 +245,391 @@ const Analise = (() => {
   /* ── Normalização das linhas ──────────────────────────────────────────── */
 
   /**
-   * Detecta automaticamente qual coluna corresponde a cada campo,
-   * aceitando variações de nome (pt-BR, inglês, abreviações).
+   * Normaliza as linhas brutas de VENDAS (planilha Alelo)
    */
-  function detectColumns(rows, type) {
-    if (!rows.length) return {};
-    const keys = Object.keys(rows[0]);
-    const find  = (candidates) =>
-      keys.find(k => candidates.some(c => k.toLowerCase().includes(c))) || null;
-
-    if (type === 'vendas') {
-      return {
-        data:      find(['data', 'emissão', 'emissao', 'date', 'venda']),
-        operadora: find(['operadora', 'operator', 'bandeira', 'rede']),
-        bruto:     find(['bruto', 'gross', 'valor bruto', 'total']),
-        taxa:      find(['taxa', 'fee', 'desconto', 'rate']),
-        liquido:   find(['líquido', 'liquido', 'net', 'valor líquido', 'valor liquido', 'líq']),
-        prazo:     find(['prazo', 'd+', 'days', 'modalidade', 'tipo']),
-        id:        find(['id', 'nsu', 'cod', 'código', 'codigo', 'ref']),
-      };
-    } else {
-      return {
-        data:      find(['data', 'pagamento', 'payment', 'recebimento', 'date']),
-        operadora: find(['operadora', 'operator', 'bandeira', 'rede']),
-        valor:     find(['valor', 'recebido', 'amount', 'pago', 'liquido', 'líquido', 'net']),
-        id:        find(['id', 'nsu', 'cod', 'ref']),
-      };
-    }
-  }
-
-  /** Normaliza as linhas brutas de VENDAS */
   function normalizeVendas(rows) {
-  const cols = detectColumns(rows, 'vendas');
-  
-  // Adicionar detecção específica para "Data de Pagamento"
-  const dataPagamentoCol = Object.keys(rows[0] || {}).find(k => 
-    k.toLowerCase().includes('data de pagamento') || 
-    k.toLowerCase().includes('pagamento') ||
-    k.toLowerCase().includes('settlement date') ||
-    k === 'M'  // fallback para coluna M (índice)
-  );
-  
-  return rows
-    .map((r, i) => {
-      const dataVenda = parseDate(cols.data ? r[cols.data] : null);
-      const bruto     = parseMoney(cols.bruto   ? r[cols.bruto]   : null);
-      const taxa      = parseMoney(cols.taxa     ? r[cols.taxa]    : null);
-      let   liquido   = parseMoney(cols.liquido  ? r[cols.liquido] : null);
-      
-      // LER DATA DE PAGAMENTO REAL DA PLANILHA (coluna M)
-      let dataPagamentoReal = null;
-      if (dataPagamentoCol) {
-        dataPagamentoReal = parseDate(r[dataPagamentoCol]);
-      }
-      
-      // Se não encontrou pela busca, tenta pegar pelo índice M (13ª coluna)
-      if (!dataPagamentoReal && r['M']) {
-        dataPagamentoReal = parseDate(r['M']);
-      }
-      
-      // Se ainda não tem, tenta pela posição do array (13º elemento = índice 12)
-      if (!dataPagamentoReal && Array.isArray(r) && r[12]) {
-        dataPagamentoReal = parseDate(r[12]);
-      }
-
-      // calcular líquido se não informado
-      if (isNaN(liquido) && !isNaN(bruto) && !isNaN(taxa)) {
-        liquido = taxa < 1 ? bruto * (1 - taxa) : bruto - taxa;
-      }
-
-      // prazo D+N (apenas para referência)
-      const prazoRaw = cols.prazo ? String(r[cols.prazo] || '') : '';
-      const prazoNum = parseInt(prazoRaw.replace(/\D/g, '')) || 30;
-
-      return {
-        _idx:        i,
-        id:          cols.id ? r[cols.id] : `V${i+1}`,
-        operadora:   normalizeOp(cols.operadora ? r[cols.operadora] : null),
-        dataVenda,
-        bruto,
-        taxa,
-        liquido,
-        prazo:       prazoNum,
-        dataPrevista: dataVenda ? addDays(dataVenda, prazoNum) : null,
-        // ⭐ NOVO: data de pagamento REAL vinda da planilha
-        dataPagamentoReal: dataPagamentoReal,
-        _raw:        r,
-      };
-    })
-    .filter(v => v.dataVenda && !isNaN(v.bruto));
-}
-
-  /** Normaliza as linhas brutas de RECEBIMENTOS */
-  function normalizeRecebimentos(rows) {
-    const cols = detectColumns(rows, 'recebimentos');
-    return rows
+    addDebugLog('NORMALIZE', 'Iniciando normalização das vendas', { totalLinhas: rows.length });
+    
+    // Mapeamento das colunas da planilha Alelo
+    const vendasNormalizadas = rows
       .map((r, i) => {
-        const dataPagamento = parseDate(cols.data ? r[cols.data] : null);
-        const valor         = parseMoney(cols.valor ? r[cols.valor] : null);
+        // Extrair dados das colunas
+        const numeroAutorizacao = r['Número da Autorização'];
+        const dataVendaStr = r['Data da Venda'];
+        const tipoCartao = r['Tipo Cartão'];
+        const valorBruto = parseMoney(r['Valor Bruto']);
+        const valorLiquido = parseMoney(r['Valor Líquido']);
+        const status = r['Status'];
+        const dataPagamentoStr = r['Data de Pagamento'];
+        const rede = r['PSR Física ou e-com'] || (r['I'] || 'Rede');
+        
+        // Determinar operadora baseado no tipo de cartão e rede
+        let operadora = 'Desconhecida';
+        if (tipoCartao) {
+          if (tipoCartao.includes('Refeição')) operadora = 'VR';
+          if (tipoCartao.includes('Alimentação')) operadora = 'Alelo';
+        }
+        if (rede && rede !== 'Rede') operadora = normalizeOp(rede);
+        
+        const dataVenda = parseDate(dataVendaStr);
+        const dataPagamentoReal = parseDate(dataPagamentoStr);
+        
+        // Calcular taxa
+        const taxa = !isNaN(valorBruto) && !isNaN(valorLiquido) 
+          ? valorBruto - valorLiquido 
+          : null;
+        
+        // Calcular prazo médio (30 dias padrão para VR)
+        const prazo = 30;
+        const dataPrevista = dataVenda ? addDays(dataVenda, prazo) : null;
+        
         return {
-          _idx:        i,
-          id:          cols.id ? r[cols.id] : null,
-          operadora:   normalizeOp(cols.operadora ? r[cols.operadora] : null),
-          dataPagamento,
-          valor,
-          _used:       false,   // marca se já foi vinculada a uma venda
-          _raw:        r,
+          _idx: i,
+          id: numeroAutorizacao || `V${i+1}`,
+          operadora: operadora,
+          dataVenda: dataVenda,
+          bruto: valorBruto,
+          liquido: valorLiquido,
+          taxa: taxa,
+          prazo: prazo,
+          dataPrevista: dataPrevista,
+          dataPagamentoReal: dataPagamentoReal,
+          tipoCartao: tipoCartao,
+          status: status,
+          _raw: r,
         };
       })
-      .filter(r => r.dataPagamento && !isNaN(r.valor));
+      .filter(v => v.dataVenda && !isNaN(v.bruto) && v.bruto > 0);
+    
+    addDebugLog('NORMALIZE', 'Vendas normalizadas', { 
+      total: vendasNormalizadas.length,
+      amostra: vendasNormalizadas.slice(0, 3).map(v => ({
+        id: v.id,
+        bruto: v.bruto,
+        liquido: v.liquido,
+        operadora: v.operadora
+      }))
+    });
+    
+    return vendasNormalizadas;
   }
 
-  /* ── Algoritmo de matching ────────────────────────────────────────────── */
-
   /**
-   * Para cada venda, tenta encontrar um recebimento correspondente.
-   * Prioriza: mesma operadora + valor dentro do threshold + data dentro da janela.
-   * Se não achar por valor exato, marca como "erro_taxa".
-   * Se não achar nada, marca como "nao_recebido".
+   * Normaliza as linhas do ERP (Olist)
    */
-  function matchAll(vendas, recebimentos) {
-  const recList = recebimentos.map(r => ({ ...r, _used: false }));
+  function normalizeERP(rows) {
+    addDebugLog('NORMALIZE', 'Iniciando normalização do ERP', { totalLinhas: rows.length });
+    
+    const erpNormalizado = rows
+      .map((r, i) => {
+        const dataVencimento = parseDate(r.vencimento);
+        const dataEmissao = parseDate(r.emissao);
+        const valor = parseMoney(r.valor);
+        
+        // Usar o número do pedido como ID para matching
+        const id = r.numeroPedido || `${r.cliente}_${i}`;
+        
+        addDebugLog('ERP_ITEM', `Processando item ${i}`, {
+          id: id,
+          valor: valor,
+          vencimento: r.vencimento,
+          historico: r.historico?.substring(0, 50)
+        });
+        
+        return {
+          _idx: i,
+          id: id,
+          numeroPedido: r.numeroPedido,
+          cliente: r.cliente,
+          historico: r.historico,
+          parcela: r.parcela,
+          data_vencimento: dataVencimento,
+          data_emissao: dataEmissao,
+          situacao: r.situacao,
+          valor_bruto: null,
+          valor_liquido: valor,
+          taxa: null,
+          _raw: r,
+          _used: false
+        };
+      })
+      .filter(r => r.data_vencimento && !isNaN(r.valor_liquido) && r.valor_liquido > 0);
+    
+    addDebugLog('NORMALIZE', 'ERP normalizado', { 
+      total: erpNormalizado.length,
+      amostra: erpNormalizado.slice(0, 3).map(r => ({
+        id: r.id,
+        valor: r.valor_liquido,
+        vencimento: fmtDate(r.data_vencimento)
+      }))
+    });
+    
+    return erpNormalizado;
+  }
 
-  return vendas.map(venda => {
-    // ⭐ PRIORIDADE: Se a venda já tem data de pagamento real na planilha, usa ela!
-    if (venda.dataPagamentoReal) {
-      // Busca recebimento que corresponde a essa data real
-      const matchReal = recList.find(r => 
-        !r._used &&
-        (r.operadora === venda.operadora || r.operadora === 'Desconhecida' || venda.operadora === 'Desconhecida') &&
-        Math.abs(r.valor - venda.liquido) / (venda.liquido || 1) <= TAXA_THRESHOLD &&
-        dateKey(r.dataPagamento) === dateKey(venda.dataPagamentoReal)
-      );
+  /* ── Algoritmo de matching (CONCILIAÇÃO) ────────────────────────────── */
+
+  function matchAll(vendas, recebimentos) {
+    addDebugLog('MATCH', 'Iniciando conciliação', { 
+      totalVendas: vendas.length, 
+      totalRecebimentos: recebimentos.length 
+    });
+    
+    const recList = recebimentos.map(r => ({ ...r, _used: false }));
+
+    const resultado = vendas.map(venda => {
+      addDebugLog('MATCH', `Conciliando venda: ${venda.id}`, {
+        valor: venda.liquido,
+        data: fmtDate(venda.dataVenda),
+        operadora: venda.operadora
+      });
       
-      if (matchReal) {
-        matchReal._used = true;
+      // Tentar match por número do pedido (se disponível)
+      let matchPorId = null;
+      if (venda.id) {
+        matchPorId = recList.find(r => 
+          !r._used && 
+          (String(r.id) === String(venda.id) || 
+           String(r.numeroPedido) === String(venda.id))
+        );
+      }
+      
+      if (matchPorId) {
+        matchPorId._used = true;
+        const taxa = venda.bruto - matchPorId.valor_liquido;
+        const taxaPercentual = (taxa / venda.bruto) * 100;
+        const atraso = venda.dataPrevista && matchPorId.data_vencimento 
+          ? matchPorId.data_vencimento > venda.dataPrevista 
+          : false;
+        
+        addDebugLog('MATCH_SUCCESS', `Venda ${venda.id} conciliada por ID`, {
+          valor_esperado: venda.liquido,
+          valor_recebido: matchPorId.valor_liquido,
+          diferenca: matchPorId.valor_liquido - venda.liquido
+        });
+        
         return {
-          ...venda,
-          status: 'ok',
-          recebimento: matchReal,
-          dataPagamento: matchReal.dataPagamento,
-          valorRecebido: matchReal.valor,
-          diferenca: matchReal.valor - venda.liquido,
-          diffDias: venda.dataPrevista ? diffDays(matchReal.dataPagamento, venda.dataPrevista) : null,
+          id: venda.id,
+          valor_bruto: venda.bruto,
+          valor_liquido: venda.liquido,
+          taxa: taxa,
+          taxa_percentual: taxaPercentual,
+          data_venda: venda.dataVenda,
+          data_vencimento: venda.dataPrevista,
+          data_pagamento: matchPorId.data_vencimento,
+          status: Math.abs(taxa) <= (venda.bruto * TAXA_THRESHOLD) ? 'OK' : 'DIVERGENTE',
+          atraso: atraso,
+          operadora: venda.operadora,
+          recebimento_id: matchPorId.id
         };
       }
       
-      // Se não achou match exato, ainda tenta vincular pela data real
-      const matchDataReal = recList.find(r => 
-        !r._used &&
-        dateKey(r.dataPagamento) === dateKey(venda.dataPagamentoReal)
-      );
+      // Match por data de pagamento real da planilha de vendas
+      if (venda.dataPagamentoReal) {
+        const matchData = recList.find(r => 
+          !r._used &&
+          dateKey(r.data_vencimento) === dateKey(venda.dataPagamentoReal)
+        );
+        
+        if (matchData) {
+          matchData._used = true;
+          const taxa = venda.bruto - matchData.valor_liquido;
+          const taxaPercentual = (taxa / venda.bruto) * 100;
+          const status = Math.abs(matchData.valor_liquido - venda.liquido) <= (venda.liquido * TAXA_THRESHOLD) 
+            ? 'OK' 
+            : 'DIVERGENTE';
+          
+          addDebugLog('MATCH_SUCCESS', `Venda ${venda.id} conciliada por data`, {
+            data_pagamento_real: fmtDate(venda.dataPagamentoReal),
+            data_vencimento_erp: fmtDate(matchData.data_vencimento)
+          });
+          
+          return {
+            id: venda.id,
+            valor_bruto: venda.bruto,
+            valor_liquido: venda.liquido,
+            taxa: taxa,
+            taxa_percentual: taxaPercentual,
+            data_venda: venda.dataVenda,
+            data_vencimento: venda.dataPrevista,
+            data_pagamento: matchData.data_vencimento,
+            status: status,
+            atraso: false,
+            operadora: venda.operadora,
+            recebimento_id: matchData.id
+          };
+        }
+      }
       
-      if (matchDataReal) {
-        matchDataReal._used = true;
-        const diffValor = Math.abs(matchDataReal.valor - venda.liquido);
+      // Match por valor aproximado + data próxima
+      const candidatos = recList.filter(r => !r._used);
+      
+      const matchValor = candidatos.find(r => {
+        const diffValor = Math.abs(r.valor_liquido - venda.liquido) / (venda.liquido || 1);
+        const dentroData = venda.dataPrevista && r.data_vencimento
+          ? diffDays(r.data_vencimento, venda.dataPrevista) <= DATE_WINDOW
+          : true;
+        return diffValor <= TAXA_THRESHOLD && dentroData;
+      });
+      
+      if (matchValor) {
+        matchValor._used = true;
+        const taxa = venda.bruto - matchValor.valor_liquido;
+        const taxaPercentual = (taxa / venda.bruto) * 100;
+        const atraso = venda.dataPrevista && matchValor.data_vencimento 
+          ? matchValor.data_vencimento > venda.dataPrevista 
+          : false;
+        
+        addDebugLog('MATCH_SUCCESS', `Venda ${venda.id} conciliada por valor`, {
+          valor_esperado: venda.liquido,
+          valor_recebido: matchValor.valor_liquido,
+          diferenca_percentual: ((matchValor.valor_liquido - venda.liquido) / venda.liquido * 100).toFixed(2) + '%'
+        });
+        
         return {
-          ...venda,
-          status: diffValor <= (venda.liquido * TAXA_THRESHOLD) ? 'ok' : 'erro_taxa',
-          recebimento: matchDataReal,
-          dataPagamento: matchDataReal.dataPagamento,
-          valorRecebido: matchDataReal.valor,
-          diferenca: matchDataReal.valor - venda.liquido,
-          diffDias: venda.dataPrevista ? diffDays(matchDataReal.dataPagamento, venda.dataPrevista) : null,
+          id: venda.id,
+          valor_bruto: venda.bruto,
+          valor_liquido: venda.liquido,
+          taxa: taxa,
+          taxa_percentual: taxaPercentual,
+          data_venda: venda.dataVenda,
+          data_vencimento: venda.dataPrevista,
+          data_pagamento: matchValor.data_vencimento,
+          status: 'OK',
+          atraso: atraso,
+          operadora: venda.operadora,
+          recebimento_id: matchValor.id
         };
       }
+      
+      // Match apenas por data (valor divergente)
+      const matchDataOnly = candidatos.find(r => {
+        const dentroData = venda.dataPrevista && r.data_vencimento
+          ? diffDays(r.data_vencimento, venda.dataPrevista) <= DATE_WINDOW * 2
+          : true;
+        return dentroData;
+      });
+      
+      if (matchDataOnly) {
+        matchDataOnly._used = true;
+        const taxa = venda.bruto - matchDataOnly.valor_liquido;
+        const taxaPercentual = (taxa / venda.bruto) * 100;
+        const atraso = venda.dataPrevista && matchDataOnly.data_vencimento 
+          ? matchDataOnly.data_vencimento > venda.dataPrevista 
+          : false;
+        
+        addDebugLog('MATCH_WARNING', `Venda ${venda.id} conciliada com divergência de valor`, {
+          valor_esperado: venda.liquido,
+          valor_recebido: matchDataOnly.valor_liquido,
+          diferenca: matchDataOnly.valor_liquido - venda.liquido
+        });
+        
+        return {
+          id: venda.id,
+          valor_bruto: venda.bruto,
+          valor_liquido: venda.liquido,
+          taxa: taxa,
+          taxa_percentual: taxaPercentual,
+          data_venda: venda.dataVenda,
+          data_vencimento: venda.dataPrevista,
+          data_pagamento: matchDataOnly.data_vencimento,
+          status: 'DIVERGENTE',
+          atraso: atraso,
+          operadora: venda.operadora,
+          recebimento_id: matchDataOnly.id
+        };
+      }
+      
+      // NENHUM MATCH ENCONTRADO
+      addDebugLog('MATCH_FAIL', `Venda ${venda.id} sem correspondência no ERP`, {
+        valor: venda.liquido,
+        data: fmtDate(venda.dataVenda)
+      });
+      
+      return {
+        id: venda.id,
+        valor_bruto: venda.bruto,
+        valor_liquido: venda.liquido,
+        taxa: null,
+        taxa_percentual: null,
+        data_venda: venda.dataVenda,
+        data_vencimento: venda.dataPrevista,
+        data_pagamento: venda.dataPagamentoReal || null,
+        status: 'NAO_ENCONTRADO',
+        atraso: null,
+        operadora: venda.operadora,
+        recebimento_id: null
+      };
+    });
+    
+    const naoUtilizados = recList.filter(r => !r._used);
+    if (naoUtilizados.length > 0) {
+      addDebugLog('MATCH_WARNING', `Recebimentos sem venda correspondente`, {
+        total: naoUtilizados.length,
+        valores: naoUtilizados.map(r => ({ id: r.id, valor: r.valor_liquido }))
+      });
     }
     
-    // Se não tem data real OU não achou match, segue lógica original...
-    const candidatos = recList.filter(r =>
-      !r._used &&
-      (r.operadora === venda.operadora || r.operadora === 'Desconhecida' || venda.operadora === 'Desconhecida')
-    );
-
-    // Resto do matching original...
-    const matchExato = candidatos.find(r => {
-      const diffValor = Math.abs(r.valor - venda.liquido) / (venda.liquido || 1);
-      const dentroData = venda.dataPrevista
-        ? diffDays(r.dataPagamento, venda.dataPrevista) <= DATE_WINDOW
-        : true;
-      return diffValor <= TAXA_THRESHOLD && dentroData;
+    addDebugLog('MATCH', 'Conciliação finalizada', {
+      total_ok: resultado.filter(r => r.status === 'OK').length,
+      total_divergente: resultado.filter(r => r.status === 'DIVERGENTE').length,
+      total_nao_encontrado: resultado.filter(r => r.status === 'NAO_ENCONTRADO').length,
+      total_atrasado: resultado.filter(r => r.atraso === true).length
     });
-
-    if (matchExato) {
-      matchExato._used = true;
-      return {
-        ...venda,
-        status: 'ok',
-        recebimento: matchExato,
-        dataPagamento: matchExato.dataPagamento,
-        valorRecebido: matchExato.valor,
-        diferenca: matchExato.valor - venda.liquido,
-        diffDias: venda.dataPrevista ? diffDays(matchExato.dataPagamento, venda.dataPrevista) : null,
-      };
-    }
-
-    const matchTaxa = candidatos.find(r => {
-      const dentroData = venda.dataPrevista
-        ? diffDays(r.dataPagamento, venda.dataPrevista) <= DATE_WINDOW * 2
-        : true;
-      return dentroData;
-    });
-
-    if (matchTaxa) {
-      matchTaxa._used = true;
-      return {
-        ...venda,
-        status: 'erro_taxa',
-        recebimento: matchTaxa,
-        dataPagamento: matchTaxa.dataPagamento,
-        valorRecebido: matchTaxa.valor,
-        diferenca: matchTaxa.valor - venda.liquido,
-        diffDias: venda.dataPrevista ? diffDays(matchTaxa.dataPagamento, venda.dataPrevista) : null,
-      };
-    }
-
-    return {
-      ...venda,
-      status: 'nao_recebido',
-      recebimento: null,
-      dataPagamento: venda.dataPagamentoReal || null,  // ← usa a data real se tiver
-      valorRecebido: null,
-      diferenca: null,
-      diffDias: null,
-    };
-  });
-}
+    
+    return resultado;
+  }
 
   /* ── Agrupamento ──────────────────────────────────────────────────────── */
 
-  /**
-   * Agrupa _resultado por (dateKey(dataVenda), operadora).
-   * Retorna array ordenado por data desc.
-   */
   function agrupar(resultado) {
     const map = {};
     resultado.forEach(v => {
-      const dk  = dateKey(v.dataVenda);
+      const dk = v.data_venda ? dateKey(v.data_venda) : 'sem-data';
       const key = `${dk}__${v.operadora}`;
       if (!map[key]) {
         map[key] = {
-          dateKey:   dk,
-          dataVenda: v.dataVenda,
+          dateKey: dk,
+          dataVenda: v.data_venda,
           operadora: v.operadora,
-          vendas:    [],
-          ok:        0,
-          erro_taxa: 0,
-          nao_recebido: 0,
-          totalBruto:  0,
+          vendas: [],
+          ok: 0,
+          divergente: 0,
+          nao_encontrado: 0,
+          atrasado: 0,
+          totalBruto: 0,
           totalLiquido: 0,
           totalRecebido: 0,
+          totalTaxas: 0
         };
       }
       const g = map[key];
       g.vendas.push(v);
-      g[v.status]++;
-      g.totalBruto   += isNaN(v.bruto)   ? 0 : v.bruto;
-      g.totalLiquido += isNaN(v.liquido) ? 0 : v.liquido;
-      if (v.valorRecebido) g.totalRecebido += v.valorRecebido;
+      if (v.status === 'OK') g.ok++;
+      if (v.status === 'DIVERGENTE') g.divergente++;
+      if (v.status === 'NAO_ENCONTRADO') g.nao_encontrado++;
+      if (v.atraso === true) g.atrasado++;
+      g.totalBruto += isNaN(v.valor_bruto) ? 0 : v.valor_bruto;
+      g.totalLiquido += isNaN(v.valor_liquido) ? 0 : v.valor_liquido;
+      if (v.valor_liquido && v.status !== 'NAO_ENCONTRADO') g.totalRecebido += v.valor_liquido;
+      if (v.taxa) g.totalTaxas += v.taxa;
     });
 
-    return Object.values(map).sort((a, b) => b.dataVenda - a.dataVenda);
+    return Object.values(map).sort((a, b) => {
+      if (!a.dataVenda) return 1;
+      if (!b.dataVenda) return -1;
+      return b.dataVenda - a.dataVenda;
+    });
   }
-
-  /* ── Filtros ──────────────────────────────────────────────────────────── */
 
   function applyFilters(grupos) {
     return grupos.filter(g => {
       if (_filtroOp !== 'TODAS' && g.operadora !== _filtroOp) return false;
-      if (_filtroPeriod.de) {
+      if (_filtroPeriod.de && g.dataVenda) {
         const de = parseDate(_filtroPeriod.de);
         if (de && g.dataVenda < de) return false;
       }
-      if (_filtroPeriod.ate) {
+      if (_filtroPeriod.ate && g.dataVenda) {
         const ate = parseDate(_filtroPeriod.ate);
         if (ate && g.dataVenda > ate) return false;
       }
@@ -427,45 +637,48 @@ const Analise = (() => {
     });
   }
 
-  /* ── Indicadores globais ──────────────────────────────────────────────── */
-
   function calcIndicadores(resultado) {
-    const total    = resultado.length;
-    const ok       = resultado.filter(v => v.status === 'ok').length;
-    const erroTaxa = resultado.filter(v => v.status === 'erro_taxa').length;
-    const naoRec   = resultado.filter(v => v.status === 'nao_recebido').length;
-    const totalBruto    = resultado.reduce((s, v) => s + (isNaN(v.bruto)   ? 0 : v.bruto), 0);
-    const totalRecebido = resultado.reduce((s, v) => s + (v.valorRecebido || 0), 0);
-    return { total, ok, erroTaxa, naoRec, totalBruto, totalRecebido };
+    const total = resultado.length;
+    const ok = resultado.filter(v => v.status === 'OK').length;
+    const divergente = resultado.filter(v => v.status === 'DIVERGENTE').length;
+    const naoRec = resultado.filter(v => v.status === 'NAO_ENCONTRADO').length;
+    const atrasado = resultado.filter(v => v.atraso === true).length;
+    const totalBruto = resultado.reduce((s, v) => s + (isNaN(v.valor_bruto) ? 0 : v.valor_bruto), 0);
+    const totalRecebido = resultado.reduce((s, v) => s + (v.valor_liquido || 0), 0);
+    const totalTaxas = resultado.reduce((s, v) => s + (v.taxa || 0), 0);
+    const taxaMedia = totalBruto > 0 ? (totalTaxas / totalBruto) * 100 : 0;
+    
+    return { total, ok, divergente, naoRec, atrasado, totalBruto, totalRecebido, totalTaxas, taxaMedia };
   }
-
-  /* ── Operadoras únicas do resultado ──────────────────────────────────── */
 
   function getOperadoras(resultado) {
-    return [...new Set(resultado.map(v => v.operadora))].sort();
+    return [...new Set(resultado.map(v => v.operadora).filter(op => op && op !== 'Desconhecida'))].sort();
   }
-
-  /* ── Exportação CSV/Excel ─────────────────────────────────────────────── */
 
   function exportarResultado(resultado) {
     const rows = resultado.map(v => ({
-      ID:           v.id || '',
-      Operadora:    v.operadora,
-      'Data Venda': fmtDate(v.dataVenda),
-      'Prazo (D+)': v.prazo,
-      'Data Prevista': fmtDate(v.dataPrevista),
-      'Valor Bruto':  isNaN(v.bruto)    ? '' : v.bruto,
-      'Valor Líquido Esperado': isNaN(v.liquido) ? '' : v.liquido,
-      Status:       v.status === 'ok' ? 'OK' : v.status === 'erro_taxa' ? 'Erro de Taxa' : 'Não Recebido',
-      'Data Pagamento': fmtDate(v.dataPagamento),
-      'Valor Recebido': v.valorRecebido ?? '',
-      'Diferença':      v.diferenca    ?? '',
+      'ID Pedido': v.id || '',
+      'Operadora': v.operadora,
+      'Data Venda': fmtDate(v.data_venda),
+      'Data Prevista': fmtDate(v.data_vencimento),
+      'Data Pagamento': fmtDate(v.data_pagamento),
+      'Atraso (dias)': v.atraso && v.data_pagamento && v.data_vencimento 
+        ? Math.ceil((v.data_pagamento - v.data_vencimento) / 86400000) 
+        : '',
+      'Valor Bruto (R$)': v.valor_bruto?.toFixed(2) || '',
+      'Valor Líquido (R$)': v.valor_liquido?.toFixed(2) || '',
+      'Taxa (R$)': v.taxa?.toFixed(2) || '',
+      'Taxa (%)': v.taxa_percentual?.toFixed(2) || '',
+      'Status': v.status === 'OK' ? 'OK' : v.status === 'DIVERGENTE' ? 'Divergente' : 'Não Encontrado',
+      'Status Atraso': v.atraso === true ? 'Atrasado' : v.atraso === false ? 'No prazo' : '—',
     }));
 
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Análise');
-    XLSX.writeFile(wb, `conciliacao_analise_${new Date().toISOString().slice(0,10)}.xlsx`);
+    XLSX.utils.book_append_sheet(wb, ws, 'Conciliação Financeira');
+    XLSX.writeFile(wb, `conciliacao_financeira_${new Date().toISOString().slice(0,10)}.xlsx`);
+    
+    addDebugLog('EXPORT', 'Arquivo exportado', { totalLinhas: rows.length });
   }
 
   /* ══════════════════════════════════════════════════════════════════════
@@ -477,17 +690,18 @@ const Analise = (() => {
     if (!section) return;
 
     const grupos = applyFilters(agrupar(_resultado));
-    const ind    = calcIndicadores(_resultado);
+    const ind = calcIndicadores(_resultado);
 
-    /* ── Indicadores ── */
-    document.getElementById('aInd_total').textContent    = ind.total;
-    document.getElementById('aInd_ok').textContent       = ind.ok;
-    document.getElementById('aInd_erro').textContent     = ind.erroTaxa;
-    document.getElementById('aInd_naoRec').textContent   = ind.naoRec;
-    document.getElementById('aInd_bruto').textContent    = fmtMoney(ind.totalBruto);
+    document.getElementById('aInd_total').textContent = ind.total;
+    document.getElementById('aInd_ok').textContent = ind.ok;
+    document.getElementById('aInd_divergente').textContent = ind.divergente;
+    document.getElementById('aInd_naoRec').textContent = ind.naoRec;
+    document.getElementById('aInd_atrasado').textContent = ind.atrasado;
+    document.getElementById('aInd_bruto').textContent = fmtMoney(ind.totalBruto);
     document.getElementById('aInd_recebido').textContent = fmtMoney(ind.totalRecebido);
+    document.getElementById('aInd_taxas').textContent = fmtMoney(ind.totalTaxas);
+    document.getElementById('aInd_taxaMedia').textContent = `${ind.taxaMedia.toFixed(2)}%`;
 
-    /* ── Cards de grupos ── */
     const container = document.getElementById('analiseGrupos');
     container.innerHTML = '';
 
@@ -501,69 +715,65 @@ const Analise = (() => {
     });
   }
 
-  /** Card visual de um grupo (data × operadora) */
   function buildGrupoCard(g) {
-    const total    = g.vendas.length;
-    const pctOk    = total ? Math.round((g.ok / total) * 100) : 0;
-    const pctErro  = total ? Math.round((g.erro_taxa / total) * 100) : 0;
-    const pctNRec  = total ? Math.round((g.nao_recebido / total) * 100) : 0;
+    const total = g.vendas.length;
+    const pctOk = total ? Math.round((g.ok / total) * 100) : 0;
+    const pctDiv = total ? Math.round((g.divergente / total) * 100) : 0;
+    const pctNRec = total ? Math.round((g.nao_encontrado / total) * 100) : 0;
+    const pctAtraso = total ? Math.round((g.atrasado / total) * 100) : 0;
 
-    // Classe de borda por operadora
-    const opClsMap = { Ticket: 'op-ticket', VR: 'op-vr', Alelo: 'op-alelo', Pluxee: 'op-pluxee' };
-    const opCls    = opClsMap[g.operadora] || '';
+    const opClsMap = { Ticket: 'op-ticket', VR: 'op-vr', Alelo: 'op-alelo', Pluxee: 'op-pluxee', Rede: 'op-rede', GetNet: 'op-getnet' };
+    const opCls = opClsMap[g.operadora] || '';
 
     const card = document.createElement('div');
     card.className = `analise-card ${opCls}`;
 
-    /* Cabeçalho */
     card.innerHTML = `
       <div class="analise-card-header">
         <div class="analise-card-title">
-          <span class="analise-date">📅 ${fmtDate(g.dataVenda)}</span>
+          <span class="analise-date">📅 ${g.dataVenda ? fmtDate(g.dataVenda) : 'Data não informada'}</span>
           <span class="analise-op-badge ${opCls}">${g.operadora}</span>
         </div>
         <div class="analise-card-meta">
           <span class="analise-meta-item">${total} venda${total !== 1 ? 's' : ''}</span>
           <span class="analise-meta-item" style="color:var(--text-dim)">Bruto: ${fmtMoney(g.totalBruto)}</span>
           <span class="analise-meta-item" style="color:var(--text-dim)">Recebido: ${fmtMoney(g.totalRecebido)}</span>
+          <span class="analise-meta-item" style="color:var(--text-dim)">Taxas: ${fmtMoney(g.totalTaxas)}</span>
         </div>
       </div>
 
-      <!-- Barra de progresso tricolor -->
       <div class="analise-bar">
-        <div class="analise-bar-ok"    style="width:${pctOk}%"   title="OK: ${g.ok}"></div>
-        <div class="analise-bar-erro"  style="width:${pctErro}%"  title="Erro: ${g.erro_taxa}"></div>
-        <div class="analise-bar-nrec"  style="width:${pctNRec}%"  title="Não rec: ${g.nao_recebido}"></div>
+        <div class="analise-bar-ok" style="width:${pctOk}%" title="OK: ${g.ok}"></div>
+        <div class="analise-bar-div" style="width:${pctDiv}%" title="Divergente: ${g.divergente}"></div>
+        <div class="analise-bar-nrec" style="width:${pctNRec}%" title="Não encontrado: ${g.nao_encontrado}"></div>
+      </div>
+      
+      <div class="analise-bar" style="margin-top: 4px;">
+        <div class="analise-bar-atraso" style="width:${pctAtraso}%" title="Atrasos: ${g.atrasado}"></div>
       </div>
 
-      <!-- Pills de resumo -->
       <div class="analise-pills">
-        <span class="analise-pill pill-ok">    ✔ ${g.ok} OK (${pctOk}%)</span>
-        <span class="analise-pill pill-warn">  ⚠ ${g.erro_taxa} Erro de taxa (${pctErro}%)</span>
-        <span class="analise-pill pill-danger">✕ ${g.nao_recebido} Não recebido (${pctNRec}%)</span>
+        <span class="analise-pill pill-ok">✔ ${g.ok} OK (${pctOk}%)</span>
+        <span class="analise-pill pill-warn">⚠ ${g.divergente} Divergente (${pctDiv}%)</span>
+        <span class="analise-pill pill-danger">✕ ${g.nao_encontrado} Não recebido (${pctNRec}%)</span>
+        <span class="analise-pill pill-atraso">⏰ ${g.atrasado} Atrasado (${pctAtraso}%)</span>
       </div>
 
-      <!-- Detalhe expansível -->
       <button class="analise-toggle-btn" data-open="0">
         <span class="analise-toggle-icon">▾</span> Ver detalhes das vendas
       </button>
       <div class="analise-detail" style="display:none"></div>
     `;
 
-    /* Toggle de detalhes */
-    const btn     = card.querySelector('.analise-toggle-btn');
-    const detail  = card.querySelector('.analise-detail');
+    const btn = card.querySelector('.analise-toggle-btn');
+    const detail = card.querySelector('.analise-detail');
     btn.addEventListener('click', () => {
       const isOpen = btn.dataset.open === '1';
       btn.dataset.open = isOpen ? '0' : '1';
       btn.querySelector('.analise-toggle-icon').textContent = isOpen ? '▾' : '▴';
-      btn.innerHTML = btn.innerHTML.replace(
-        isOpen ? 'Fechar' : 'Ver detalhes das vendas',
-        isOpen ? 'Ver detalhes das vendas' : 'Fechar'
-      );
       if (!isOpen) {
         detail.style.display = 'block';
-        detail.innerHTML     = buildDetailTable(g.vendas);
+        detail.innerHTML = buildDetailTable(g.vendas);
       } else {
         detail.style.display = 'none';
       }
@@ -572,26 +782,31 @@ const Analise = (() => {
     return card;
   }
 
-  /** Tabela detalhada de vendas de um grupo */
   function buildDetailTable(vendas) {
     const rows = vendas
-      .sort((a, b) => (a.status === 'ok' ? 1 : -1))
+      .sort((a, b) => {
+        const ordem = { 'OK': 1, 'DIVERGENTE': 2, 'NAO_ENCONTRADO': 3 };
+        return (ordem[a.status] || 4) - (ordem[b.status] || 4);
+      })
       .map(v => {
-        const stCls  = v.status === 'ok' ? 'status-ok' : v.status === 'erro_taxa' ? 'status-warn' : 'status-danger';
-        const stLbl  = v.status === 'ok' ? '✔ OK' : v.status === 'erro_taxa' ? '⚠ Erro de taxa' : '✕ Não recebido';
-        const diff   = v.diferenca !== null ? fmtMoney(Math.abs(v.diferenca)) : '—';
-        const diffCls = v.diferenca > 0 ? 'diff-pos' : v.diferenca < 0 ? 'diff-neg' : '';
-
+        const stCls = v.status === 'OK' ? 'status-ok' : v.status === 'DIVERGENTE' ? 'status-warn' : 'status-danger';
+        const stLbl = v.status === 'OK' ? '✔ OK' : v.status === 'DIVERGENTE' ? '⚠ Divergente' : '✕ Não recebido';
+        const atrasoDias = v.atraso && v.data_pagamento && v.data_vencimento 
+          ? Math.ceil((v.data_pagamento - v.data_vencimento) / 86400000)
+          : null;
+        
         return `
-          <tr>
+          <tr class="${v.atraso ? 'row-atrasado' : ''}">
             <td class="dt-id">${v.id || '—'}</td>
-            <td>${fmtMoney(v.bruto)}</td>
-            <td>${fmtMoney(v.liquido)}</td>
-            <td>${fmtDate(v.dataPrevista)}</td>
+            <td>${v.operadora || '—'}</td>
+            <td>${fmtMoney(v.valor_bruto)}</td>
+            <td>${fmtMoney(v.valor_liquido)}</td>
+            <td>${fmtMoney(v.taxa)}</td>
+            <td>${v.taxa_percentual ? v.taxa_percentual.toFixed(2) + '%' : '—'}</td>
+            <td>${fmtDate(v.data_vencimento)}</td>
             <td class="${stCls}">${stLbl}</td>
-            <td>${fmtDate(v.dataPagamento)}</td>
-            <td>${fmtMoney(v.valorRecebido)}</td>
-            <td class="${diffCls}">${v.diferenca !== null ? (v.diferenca >= 0 ? '+' : '-') + diff : '—'}</td>
+            <td>${fmtDate(v.data_pagamento)}</td>
+            <td class="${v.atraso ? 'diff-neg' : 'diff-pos'}">${v.atraso === true ? `${atrasoDias} dias` : v.atraso === false ? 'No prazo' : '—'}</td>
           </tr>`;
       }).join('');
 
@@ -601,21 +816,21 @@ const Analise = (() => {
           <thead>
             <tr>
               <th>ID/NSU</th>
-              <th>Bruto</th>
-              <th>Líquido Esperado</th>
-              <th>Prev. Receb.</th>
+              <th>Operadora</th>
+              <th>Valor Bruto</th>
+              <th>Valor Líquido</th>
+              <th>Taxa (R$)</th>
+              <th>Taxa (%)</th>
+              <th>Data Prevista</th>
               <th>Status</th>
-              <th>Data Pagto.</th>
-              <th>Valor Recebido</th>
-              <th>Diferença</th>
+              <th>Data Pagamento</th>
+              <th>Atraso</th>
             </tr>
           </thead>
           <tbody>${rows}</tbody>
         </table>
       </div>`;
   }
-
-  /* ── Filtros UI ───────────────────────────────────────────────────────── */
 
   function populateFiltroOp() {
     const sel = document.getElementById('filtroOperadora');
@@ -625,15 +840,12 @@ const Analise = (() => {
       ops.map(op => `<option value="${op}">${op}</option>`).join('');
   }
 
-  /* ── Inicialização da UI ──────────────────────────────────────────────── */
-
   function init() {
-    /* ── Botão de processamento ── */
     const btnProcessar = document.getElementById('btnProcessarAnalise');
     if (btnProcessar) {
       btnProcessar.addEventListener('click', async () => {
         const fileVendas = document.getElementById('fileVendas').files[0];
-        const fileRec    = document.getElementById('fileRecebimentos').files[0];
+        const fileRec = document.getElementById('fileRecebimentos').files[0];
 
         if (!fileVendas || !fileRec) {
           showAnaliseFeedback('⚠ Selecione os dois arquivos antes de processar.', 'warn');
@@ -642,35 +854,37 @@ const Analise = (() => {
 
         setBtnLoading(btnProcessar, true);
         showAnaliseFeedback('Lendo arquivos...', 'info');
+        _debugLogs = [];
 
         try {
           const [rawVendas, rawRec] = await Promise.all([
             readFile(fileVendas),
-            readFile(fileRec),
+            readERPFile(fileRec),
           ]);
 
-          _vendas       = normalizeVendas(rawVendas);
-          _recebimentos = normalizeRecebimentos(rawRec);
-          _resultado    = matchAll(_vendas, _recebimentos);
+          _vendas = normalizeVendas(rawVendas);
+          _recebimentos = normalizeERP(rawRec);
+          _resultado = matchAll(_vendas, _recebimentos);
+
+          showDebugLogs();
 
           showAnaliseFeedback(`✔ ${_vendas.length} vendas × ${_recebimentos.length} recebimentos processados.`, 'ok');
           populateFiltroOp();
           renderDashboard();
 
-          // Mostrar seção do dashboard
           document.getElementById('analiseDashboard').style.display = 'block';
-          document.getElementById('analiseEmpty').style.display     = 'none';
+          document.getElementById('analiseEmpty').style.display = 'none';
 
         } catch (err) {
           console.error(err);
           showAnaliseFeedback('❗ Erro ao ler arquivo. Verifique o formato.', 'danger');
+          addDebugLog('ERROR', 'Erro no processamento', err);
         } finally {
           setBtnLoading(btnProcessar, false);
         }
       });
     }
 
-    /* ── Filtro operadora ── */
     const selOp = document.getElementById('filtroOperadora');
     if (selOp) {
       selOp.addEventListener('change', () => {
@@ -679,7 +893,6 @@ const Analise = (() => {
       });
     }
 
-    /* ── Filtros de período ── */
     document.getElementById('filtroDe')?.addEventListener('change', (e) => {
       _filtroPeriod.de = e.target.value;
       renderDashboard();
@@ -690,17 +903,15 @@ const Analise = (() => {
       renderDashboard();
     });
 
-    /* ── Limpar filtros ── */
     document.getElementById('btnLimparFiltros')?.addEventListener('click', () => {
       _filtroOp = 'TODAS';
       _filtroPeriod = { de: '', ate: '' };
       if (selOp) selOp.value = 'TODAS';
-      document.getElementById('filtroDe').value  = '';
+      document.getElementById('filtroDe').value = '';
       document.getElementById('filtroAte').value = '';
       renderDashboard();
     });
 
-    /* ── Exportar ── */
     document.getElementById('btnExportar')?.addEventListener('click', () => {
       if (!_resultado.length) {
         showAnaliseFeedback('⚠ Nenhum dado para exportar.', 'warn');
@@ -709,18 +920,16 @@ const Analise = (() => {
       exportarResultado(_resultado);
     });
 
-    /* ── Drag & Drop nos inputs de arquivo ── */
-    setupDropZone('dropVendas',       'fileVendas');
+    setupDropZone('dropVendas', 'fileVendas');
     setupDropZone('dropRecebimentos', 'fileRecebimentos');
   }
 
   function setupDropZone(zoneId, inputId) {
-    const zone  = document.getElementById(zoneId);
+    const zone = document.getElementById(zoneId);
     const input = document.getElementById(inputId);
     if (!zone || !input) return;
 
     zone.addEventListener('click', () => input.click());
-
     zone.addEventListener('dragover', (e) => {
       e.preventDefault();
       zone.classList.add('dz-over');
@@ -737,7 +946,6 @@ const Analise = (() => {
         updateDropZoneLabel(zone, file.name);
       }
     });
-
     input.addEventListener('change', () => {
       if (input.files[0]) updateDropZoneLabel(zone, input.files[0].name);
     });
@@ -760,13 +968,11 @@ const Analise = (() => {
     const el = document.getElementById('analiseFeedback');
     if (!el) return;
     el.textContent = msg;
-    el.className   = `analise-feedback analise-feedback-${type}`;
+    el.className = `analise-feedback analise-feedback-${type}`;
   }
 
-  /* ── API pública ──────────────────────────────────────────────────────── */
   return { init };
 
 })();
 
-/* ── Bootstrap ─────────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => Analise.init());
